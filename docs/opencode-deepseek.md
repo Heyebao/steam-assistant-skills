@@ -1,6 +1,6 @@
 # OpenCode + DeepSeek 兼容性与迁移路线
 
-核对日期：2026-10-18。本文根据项目源码和下列官方文档整理。本文没有在 OpenCode 中安装组件、配置 API Key、运行 DeepSeek 或执行 Steam 交易。
+核对日期：2026-10-18。本文根据项目源码、既有项目验证记录和下列官方文档整理；没有重新运行既有测试，也没有在 OpenCode 中安装组件、配置 API Key、运行 DeepSeek 或执行 Steam 交易。
 
 **可以用 OpenCode + DeepSeek 完成同类工作，但需要给 OpenCode 配齐实际工具，再适配浏览器执行层。** 复制 skill 能复用规则、参考文档与离线代码；更换模型不会自动获得 Codex 会话里的浏览器、Windows 桌面或其他专用工具。当前项目不应宣传为“在 OpenCode 中开箱即用的全自动挂卡上架器”。
 
@@ -103,7 +103,7 @@ OpenCode 的本地 MCP 命令是“程序及参数数组”，不是其他客户
 
 `cmd /c npx` 来自官方 Windows 子进程兼容写法；用于 Playwright 是同一启动方式的适配，仍需本机验证。示例中的 `@latest` 方便辨认官方包，实施验收后应记录并固定实际版本。核对日 Playwright MCP 主线声明 Node `>=18`，DevTools MCP 为 `^20.19.0 || ^22.12.0 || >=23`；安装时以所选版本及依赖声明为准。[Windows 启动依据](https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/main/docs/troubleshooting.md#windows-10-error-during-discovery-for-mcp-server-chrome-devtools-mcp-error--32000-connection-closed)、[Playwright engines](https://github.com/microsoft/playwright-mcp/blob/main/package.json)、[DevTools engines](https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/main/package.json)
 
-权限模板属于工具审批配置，并不是浏览器只读沙箱。获得一次工具调用许可，也不等于批准一份交易计划；特别是 evaluate 类工具既可读页面也可执行修改。项目要求的交易批准、账户检查和人工环节仍需独立遵守。V2 规则以最后匹配项生效，MCP action 名通常是 `<server>_<tool>`。[官方权限语义](https://opencode.ai/v2/docs/permissions/)
+权限模板属于工具审批配置，并不是浏览器只读沙箱。获得一次工具调用许可，也不等于批准一份交易计划；特别是 evaluate 类工具既可读页面也可执行修改。项目要求的交易批准、账户检查和人工环节仍需独立遵守。V2 规则以最后匹配项生效，MCP action 名通常是 `<server>_<tool>`；使用前还需核对全局配置和所选 agent 的后续覆盖规则。[官方权限语义](https://opencode.ai/v2/docs/permissions/)
 
 ## 5. runner 真正要补的适配层
 
@@ -122,6 +122,15 @@ OpenCode 的本地 MCP 命令是“程序及参数数组”，不是其他客户
 
 新适配器至少要覆盖：工具超时但页面动作可能已完成、账户或页面切换、旧扫描、helper 缺失/不兼容、未知锁、价格/费用不符、撤单后返回 asset 集合变化、手机确认待处理、持久化失败及重复执行。先跑四组现有离线套件，再用 mock MCP 做相同不变量验证；最后只读连接真浏览器并校验数量零页面。当前仓库没有宣称这些新 MCP 测试已经实现或通过。
 
+按前文安装到项目 `.opencode/skills` 后，可从项目根目录执行已有离线套件：
+
+```powershell
+node .opencode/skills/steam-market-listing/scripts/test-steam-market-reprice.cjs
+node .opencode/skills/steam-market-listing/scripts/test-steam-market-reprice-staged.cjs
+node .opencode/skills/steam-market-listing/scripts/test-steam-market-native-io.cjs
+node .opencode/skills/steam-market-listing/scripts/test-steam-market-helper-contract.cjs
+```
+
 ## 6. 分阶段验收
 
 1. **文档与离线代码**：OpenCode 能显式加载两个 skill、读取其参考文件并运行四个已有 Node 测试；此阶段不连接 Steam。
@@ -135,3 +144,7 @@ OpenCode 的本地 MCP 命令是“程序及参数数组”，不是其他客户
 本仓库可以只记录官方 MCP 包的配置方式，不需要复制第三方实现。若以后复制或修改 Playwright MCP/Chrome DevTools MCP 源码，两者核对时均为 Apache-2.0：分发时保留许可证及相关署名，标示修改；上游有适用 NOTICE 时一并保留。项目自身 skill/scripts 的许可证与第三方组件许可证分别记录；依赖许可也要按实际分发内容保留。[Playwright LICENSE](https://github.com/microsoft/playwright-mcp/blob/main/LICENSE)、[Chrome DevTools MCP LICENSE](https://github.com/ChromeDevTools/chrome-devtools-mcp/blob/main/LICENSE)
 
 上文链接均为官方文档或官方项目源码。网页和 `main` 分支会变化；实现适配时应补上实际 release/tag/commit、测试日期和环境，只有完成相应验证后才把本表中的“待适配/未验证”改为已支持。
+
+## 发布验证补记
+
+研究阶段没有重新运行既有测试。随后公开发布阶段已在本地和远端重新克隆副本运行六套离线测试，均通过；GitHub Actions 的 Linux/Windows × Node 22/24 四个任务也实际成功。该结果仅验证本项目离线代码，不改变 OpenCode/DeepSeek/MCP 端到端尚未运行的边界。首次成功的 [CI 记录](https://github.com/Heyebao/steam-assistant-skills/actions/runs/39129729624) 对应公开打包提交。
