@@ -23,7 +23,7 @@ function makePlan(groupCount = 2) {
 function fixture(options = {}) {
     const ledger = makePlan(options.groupCount), source = clone(ledger.rows), cancelled = new Set(), accepted = new Set();
     const groupCount = new Set(source.map(hashFor)).size;
-    const saves = [], events = [], calls = { market: 0, inventory: 0, cancel: [], open: 0, price: [], verify: 0, click: 0 };
+    const saves = [], events = [], calls = { preflight: 0, market: 0, inventory: 0, cancel: [], open: 0, price: [], verify: 0, click: 0 };
     let activeReads = 0, maxActiveReads = 0, opened = false;
     let releaseRead;
     const blockedRead = options.blockRead || (options.blockInventory ? 'inventory' : null);
@@ -46,6 +46,11 @@ function fixture(options = {}) {
         } finally { activeReads--; events.push(kind + ':end'); }
     }
     const io = {
+        async preflightNative(groups, expectedAccount) {
+            calls.preflight++; events.push('preflight');
+            assert.equal(cancelled.size, 0, 'read-only native preflight precedes all cancellations');
+            return { account: expectedAccount, hashes: groups.map(g => g.hash) };
+        },
         readMarket() {
             if (options.syncThrow === 'market') return throwSync('market');
             return read('market', () => ({ account, rows: source.flatMap(row => {
@@ -63,9 +68,11 @@ function fixture(options = {}) {
             return read('inventory', () => {
                 const rows = source.filter(row => cancelled.has(row.assetid)).map(row => ({
                     assetid: returnedId(row), hash: hashFor(row), eligible: true, pending: accepted.has(returnedId(row)),
+                    state: accepted.has(returnedId(row)) ? 'EXTERNAL_PENDING' : 'DISCOVERED', locked: accepted.has(returnedId(row)),
                 }));
                 if (options.extraReturnedCopy && cancelled.size === source.length) rows.push({
                     assetid: '9999', hash: hashFor(source[0]), eligible: true, pending: false,
+                    state: 'DISCOVERED', locked: false,
                 });
                 rows.account = account;
                 return rows;
@@ -126,13 +133,13 @@ function fixture(options = {}) {
 }
 
 async function oneStep(f, runner = f.runner) {
-    const before = { cancel: f.calls.cancel.length, open: f.calls.open, price: f.calls.price.length,
+    const before = { preflight: f.calls.preflight, cancel: f.calls.cancel.length, open: f.calls.open, price: f.calls.price.length,
         click: f.calls.click, market: f.calls.market, inventory: f.calls.inventory };
     f.steps++;
     const result = await runner.runStep();
     assert.ok(f.calls.cancel.length - before.cancel <= 1, 'one step cancels at most one card');
     assert.ok(f.calls.price.length - before.price <= 1, 'one step fills at most one price group');
-    const phases = Number(f.calls.cancel.length > before.cancel) + Number(f.calls.open > before.open) +
+    const phases = Number(f.calls.preflight > before.preflight) + Number(f.calls.cancel.length > before.cancel) + Number(f.calls.open > before.open) +
         Number(f.calls.price.length > before.price) + Number(f.calls.click > before.click) +
         Number(f.calls.market > before.market || f.calls.inventory > before.inventory);
     assert.ok(phases <= 1, 'a step cannot combine baseline/return/reconciliation reads with a transaction phase');
@@ -170,6 +177,9 @@ async function main() {
     const success = fixture();
     const first = await oneStep(success);
     assert.equal(Boolean(first?.halted), false);
+    assert.deepEqual(success.calls.cancel, [], 'native preflight is its own read-only step');
+    assert.equal(success.calls.preflight, 1); assert.equal(success.calls.market, 0);
+    await oneStep(success);
     assert.deepEqual(success.calls.cancel, [], 'baseline is its own read-only step');
     const summary = await complete(success);
     assert.equal(summary.pending, 3);
@@ -219,6 +229,7 @@ async function main() {
     assert.equal(duplicate.calls.open, 0); assert.equal(duplicate.calls.click, 0);
 
     const readFailure = fixture({ failMarket: true, blockInventory: true });
+    await oneStep(readFailure);
     let settled = false;
     const running = readFailure.runner.runStep().then(value => { settled = true; return value; }, error => { settled = true; throw error; });
     for (let i = 0; i < 12; i++) await Promise.resolve();
@@ -291,6 +302,7 @@ async function main() {
     for (const syncThrow of ['market', 'inventory']) {
         const sibling = syncThrow === 'market' ? 'inventory' : 'market';
         const syncFailure = fixture({ syncThrow, blockRead: sibling });
+        await oneStep(syncFailure);
         let syncSettled = false;
         const syncRun = syncFailure.runner.runStep().then(value => { syncSettled = true; return value; });
         for (let i = 0; i < 12; i++) await Promise.resolve();

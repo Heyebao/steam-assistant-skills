@@ -21,6 +21,7 @@ function simulation(options = {}) {
     const idFor = r => '30' + r.assetid.slice(2);
     const hashFor = r => decodeURIComponent(new URL(r.url).pathname.split('/').at(-1));
     const io = {
+        async preflightNative(groups, expectedAccount) { return { account: expectedAccount, hashes: groups.map(g => g.hash) }; },
         async readMarket() {
             const rows = ledger.rows.flatMap(r => {
                 if (!cancelled.has(r.assetid)) return [{ listingid: r.listingid, appid: '753', observed_contextid: '6',
@@ -35,6 +36,8 @@ function simulation(options = {}) {
         async readInventory() {
             const rows = ledger.rows.flatMap(r => cancelled.has(r.assetid) && (!confirmed || options.staleInventory) ? [{
                 assetid: idFor(r), hash: hashFor(r), eligible: !options.tradeLocked, pending: submitted.has(idFor(r)) && !confirmed,
+                state: submitted.has(idFor(r)) && !confirmed ? 'EXTERNAL_PENDING' : 'DISCOVERED',
+                locked: submitted.has(idFor(r)) && !confirmed,
             }] : []);
             if (options.extraCopy) rows.push({ assetid: '9001', hash: hashFor(ledger.rows[0]), eligible: true, pending: false });
             rows.account = options.wrongInventoryAccount ? 'Unexpected account' : account;

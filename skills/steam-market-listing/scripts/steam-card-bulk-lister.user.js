@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam 卡牌批量上架助手（本地审计版）
 // @namespace    codex.local.steam-card-listing
-// @version      0.3.1
+// @version      0.4.0
 // @description  只读盘点、取价、DOM 审计元数据与精简摘要；真实提交由原生页面流程处理。
 // @match        https://steamcommunity.com/id/*/inventory*
 // @match        https://steamcommunity.com/profiles/*/inventory*
@@ -18,15 +18,12 @@
     const LEDGER_KEY = 'codex.steamCardListing.ledger.v1';
     const PRICE_CACHE_KEY = 'codex.steamCardListing.priceCache.v1';
     const PANEL_ID = 'codex-steam-card-listing-panel';
+    const HELPER_VERSION = '0.4.0';
+    const AUDIT_SCHEMA = 2;
     const CACHE_TTL_MS = 10 * 60 * 1000;
-    const DEFAULT_BATCH_SIZE = 20;
-    const DELAY_MIN_MS = 800;
-    const DELAY_MAX_MS = 1500;
     const PRICE_DELAY_MIN_MS = 650;
     const PRICE_DELAY_MAX_MS = 1000;
     const READ_REQUEST_TIMEOUT_MS = 15 * 1000;
-    const SELL_REQUEST_TIMEOUT_MS = 20 * 1000;
-    const MAX_ATTEMPTS = 3;
     const MAX_ITEMS_GUARD = 250;
     const MAX_RECEIVE_PER_ITEM_CENTS = 10000;
     const MAX_RECEIVE_TOTAL_CENTS = 100000;
@@ -54,7 +51,9 @@
         panel: null,
         shadow: null,
         logLines: [],
+        scan: { generation: null, status: 'NOT_SCANNED', complete: false, startedAt: null, completedAt: null, error: null },
     };
+    const quoteRequests = new Map();
 
     function nowIso() {
         return new Date().toISOString();
@@ -78,12 +77,17 @@
         ]).finally(() => clearTimeout(timeout));
     }
 
-    async function fetchReadOnly(url, options = {}, label = '只读请求') {
+    async function fetchReadOnly(url, options = {}, label = '只读请求', bodyType = 'json') {
         if (options.method && options.method.toUpperCase() !== 'GET') throw new Error('只读助手仅允许 GET。');
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), READ_REQUEST_TIMEOUT_MS);
         try {
-            return await fetch(url, { ...options, signal: controller.signal });
+            const response = await fetch(url, { ...options, signal: controller.signal });
+            // Fetch resolves at headers. Keep the abort timer until the entire body is read.
+            // Error pages may be HTML even for a JSON endpoint. Preserve HTTP
+            // status classification instead of turning 429/401 into a parse error.
+            const body = await response[response.ok ? bodyType : 'text']();
+            return { ok: response.ok, status: response.status, body };
         } catch (error) {
             if (error?.name === 'AbortError') {
                 throw new Error(`${label}超过 ${Math.round(READ_REQUEST_TIMEOUT_MS / 1000)} 秒，已安全停止。`);
@@ -209,7 +213,7 @@
     }
 
     function promiseFromSteamDeferred(result) {
-        if (!result) return Promise.resolve();
+        if (!result) throw new Error('完整库存接口没有提供可观察的完成结果。');
         if (typeof result.then === 'function') return Promise.resolve(result);
         if (typeof result.done === 'function') {
             return new Promise((resolve, reject) => {
@@ -217,12 +221,26 @@
                 if (typeof result.fail === 'function') result.fail(reject);
             });
         }
-        return Promise.resolve();
+        throw new Error('完整库存接口没有提供可等待的完成结果。');
+    }
+
+    function assertScanScope(proof) {
+        const active = globalThis.g_ActiveInventory;
+        if (!proof || active !== proof.inventory || JSON.stringify(proof.scope) !== JSON.stringify(currentScope()) ||
+            String(active?.m_appid || active?.appid || '') !== APP_ID ||
+            String(active?.m_contextid || active?.contextid || '') !== DEFAULT_CONTEXT_ID) {
+            throw new Error('盘点期间账户、页面或所选库存发生变化；旧结果不能证明完整库存。');
+        }
     }
 
     async function loadCompleteInventory() {
         const active = globalThis.g_ActiveInventory;
         if (!active) throw new Error('Steam 库存对象尚未加载，请刷新页面后重试。');
+        const scope = currentScope();
+        if (String(active.m_appid || active.appid || '') !== APP_ID ||
+            String(active.m_contextid || active.contextid || '') !== DEFAULT_CONTEXT_ID) {
+            throw new Error('请选择 Steam 社区物品库存 753/6，再完整盘点。');
+        }
         const targets = [];
         if (active.m_rgChildInventories) targets.push(...Object.values(active.m_rgChildInventories));
         targets.push(active);
@@ -230,14 +248,12 @@
         for (const inventory of targets) {
             if (!inventory || seen.has(inventory)) continue;
             seen.add(inventory);
-            if (typeof inventory.LoadCompleteInventory === 'function') {
-                await withTimeout(
-                    promiseFromSteamDeferred(inventory.LoadCompleteInventory()),
-                    READ_REQUEST_TIMEOUT_MS,
-                    '加载完整库存',
-                );
-            }
+            if (typeof inventory.LoadCompleteInventory !== 'function') throw new Error('库存缺少完整加载接口；不能证明盘点完整。');
+            await withTimeout(promiseFromSteamDeferred(inventory.LoadCompleteInventory()), READ_REQUEST_TIMEOUT_MS, '加载完整库存');
         }
+        const proof = { scope, inventory: active };
+        assertScanScope(proof);
+        return proof;
     }
 
     function collectFromInventoryObjects() {
@@ -267,7 +283,8 @@
                         description,
                     },
                 );
-                if (normalized) assets.push(normalized);
+                if (!normalized) throw new Error('库存资产缺少完整身份或描述；不能证明盘点完整。');
+                assets.push(normalized);
             }
             for (const child of Object.values(inventory.m_rgChildInventories || {})) {
                 walk(child, descriptions);
@@ -332,17 +349,51 @@
         const response = await fetchReadOnly('/market/', {
             credentials: 'include',
             headers: { 'X-Requested-With': 'XMLHttpRequest' },
-        }, '读取 Steam 待确认挂单');
+        }, '读取 Steam 待确认挂单', 'text');
         if (!response.ok) throw new Error(`无法读取 Steam 待确认挂单（HTTP ${response.status}）。`);
-        const html = await response.text();
+        const html = response.body;
         if (!html.includes('my_market_selllistings') && !html.includes('CancelMarketListingConfirmation')) {
             throw new Error('Steam 市场页面结构无法识别；安全起见停止。');
         }
         return parsePendingListingConfirmations(html);
     }
 
-    function emptyLedger() {
-        return { version: 1, createdAt: nowIso(), updatedAt: nowIso(), assets: {} };
+    function currentScope() {
+        const account = document.querySelector('#account_pulldown')?.innerText?.trim();
+        const url = new URL(location.href);
+        if (!account || url.origin !== 'https://steamcommunity.com' ||
+            !/^\/(?:id|profiles)\/[^/]+\/inventory\/?$/.test(url.pathname)) throw new Error('无法确认当前账户与库存页面。');
+        return { account, inventoryProfileUrl: url.origin + url.pathname.replace(/\/$/, ''), appid: APP_ID, contextid: DEFAULT_CONTEXT_ID };
+    }
+
+    function ledgerKey(scope = currentScope()) {
+        return LEDGER_KEY + '.v2.' + encodeURIComponent(JSON.stringify(scope));
+    }
+
+    function emptyLedger(scope = currentScope()) {
+        return { version: 2, scope, createdAt: nowIso(), updatedAt: nowIso(), assets: {} };
+    }
+
+    function assetLock(row) {
+        if (!Object.values(STATES).includes(row?.state)) return { locked: true, lockReason: 'UNKNOWN_STATE' };
+        if ([STATES.EXTERNAL_PENDING, STATES.SUBMITTING, STATES.SUBMITTED, STATES.PAUSED_CONFIRMATIONS,
+            STATES.RECONCILE_PENDING, STATES.OUTCOME_UNKNOWN, STATES.QUARANTINED, STATES.ACTIVE].includes(row.state)) {
+            return { locked: true, lockReason: row.state };
+        }
+        if (row.appid !== APP_ID || row.contextid !== DEFAULT_CONTEXT_ID) return { locked: true, lockReason: 'UNSUPPORTED_CONTEXT' };
+        if (!row.marketable || !row.tradable) return { locked: true, lockReason: 'ASSET_NOT_ELIGIBLE' };
+        return { locked: false, lockReason: null };
+    }
+
+    function parseStoredLedger(raw, expectedVersion) {
+        let value;
+        try { value = JSON.parse(raw); } catch (_) { throw new Error('本助手台账损坏；保持锁定，先人工恢复，不得当作首次使用。'); }
+        if (!value || value.version !== expectedVersion || !value.assets || typeof value.assets !== 'object' || Array.isArray(value.assets) ||
+            Object.entries(value.assets).some(([id, row]) => !row || typeof row.assetid !== 'string' || row.assetid !== id ||
+                typeof row.state !== 'string' || !row.state.trim())) {
+            throw new Error('本助手台账结构不兼容；停止盘点与预演，保留原始记录。');
+        }
+        return value;
     }
 
     function migrateLedgerForSafety(ledger) {
@@ -366,9 +417,11 @@
                 migrated = true;
                 continue;
             }
-            const oldRejectedByConfirmationLimit = row?.state === STATES.PAUSED_CONFIRMATIONS && !row.submittedAt;
-            if (oldRejectedByConfirmationLimit) {
-                row.state = STATES.RETRYABLE_ERROR;
+            const oldUnresolvedConfirmation = row?.state === STATES.PAUSED_CONFIRMATIONS && !row.submittedAt;
+            if (oldUnresolvedConfirmation) {
+                // Missing submission metadata or a generic UI message is not
+                // authoritative rejection evidence. Preserve the historical lock.
+                row.state = STATES.RECONCILE_PENDING;
                 row.selected = false;
                 migrated = true;
             }
@@ -377,23 +430,34 @@
     }
 
     function loadLedger() {
-        try {
-            const parsed = JSON.parse(localStorage.getItem(LEDGER_KEY) || 'null');
-            if (parsed?.version === 1 && parsed.assets && typeof parsed.assets === 'object') {
-                const migrated = migrateLedgerForSafety(parsed);
-                if (migrated) {
-                    parsed.updatedAt = nowIso();
-                    localStorage.setItem(LEDGER_KEY, JSON.stringify(parsed));
+        const scope = currentScope(), raw = localStorage.getItem(ledgerKey(scope));
+        const ledger = raw === null ? emptyLedger(scope) : parseStoredLedger(raw, 2);
+        if (JSON.stringify(ledger.scope) !== JSON.stringify(scope)) throw new Error('台账账户或库存范围不一致。');
+        // The old ledger had no account binding. Import locks conservatively into each
+        // new scope, never its old selections/prices. Keep the legacy source untouched.
+        if (!ledger.legacyLocksImported) {
+            const legacyRaw = localStorage.getItem(LEDGER_KEY);
+            if (legacyRaw !== null) {
+                const legacy = parseStoredLedger(legacyRaw, 1);
+                migrateLedgerForSafety(legacy);
+                for (const [id, row] of Object.entries(legacy.assets)) {
+                    if (row.appid !== APP_ID || !assetLock(row).locked) continue;
+                    const existing = ledger.assets[id];
+                    if (!existing || !assetLock(existing).locked) ledger.assets[id] = {
+                        ...row, selected: false, presentInInventory: false, legacyUnboundLock: true,
+                    };
                 }
-                return parsed;
             }
-        } catch (_) {}
-        return emptyLedger();
+            ledger.legacyLocksImported = true;
+            saveLedger(ledger);
+        }
+        return ledger;
     }
 
     function saveLedger(ledger) {
+        if (JSON.stringify(ledger.scope) !== JSON.stringify(currentScope())) throw new Error('台账范围已改变，未保存。');
         ledger.updatedAt = nowIso();
-        localStorage.setItem(LEDGER_KEY, JSON.stringify(ledger));
+        localStorage.setItem(ledgerKey(ledger.scope), JSON.stringify(ledger));
     }
 
     function loadPriceCache() {
@@ -418,6 +482,7 @@
     function resolveScannedState(existing, externalPending) {
         if (externalPending) return { state: STATES.EXTERNAL_PENDING, selected: false };
         if (existing.state === STATES.EXTERNAL_PENDING) {
+            if (existing.priorLockedState) return { state: existing.priorLockedState, selected: false };
             if (existing.submittedAt || existing.submissionOutcomeUnknown) {
                 return {
                     state: STATES.RECONCILE_PENDING,
@@ -425,9 +490,13 @@
                     lastError: 'Steam 待确认记录已消失，但库存仍显示；等待缓存同步后再次对账，禁止重提。',
                 };
             }
-            return { state: STATES.DISCOVERED, selected: true };
+            return {
+                state: STATES.RECONCILE_PENDING,
+                selected: false,
+                lastError: '外部待确认记录已消失但结果未经权威核验；保持锁定，不因库存仍显示而重提。',
+            };
         }
-        const lockedState = [
+        const lockedState = existing.state && !Object.values(STATES).includes(existing.state) || [
             STATES.SUBMITTING,
             STATES.SUBMITTED,
             STATES.PAUSED_CONFIRMATIONS,
@@ -453,6 +522,8 @@
             ledger.assets[card.assetid] = {
                 ...existing,
                 ...card,
+                priorLockedState: externalPending && existing.state !== STATES.EXTERNAL_PENDING && assetLock(existing).locked && existing.state
+                    ? existing.state : existing.priorLockedState,
                 original_contextid: String(existing.original_contextid || existing.submittedContextid || existing.contextid || card.contextid),
                 observed_contextid: String(card.contextid),
                 foil: isFoilCard(card),
@@ -480,24 +551,45 @@
             .sort((a, b) => a.market_hash_name.localeCompare(b.market_hash_name) || a.assetid.localeCompare(b.assetid));
     }
 
+    function beginAuditScan() {
+        runtime.scanProof = null;
+        runtime.scan = { generation: Date.now().toString(36) + '-' + Math.random().toString(36).slice(2),
+            status: 'RUNNING', complete: false, startedAt: nowIso(), completedAt: null, error: null };
+    }
+
+    function finishAuditScan(proof) {
+        assertScanScope(proof);
+        runtime.scanProof = proof;
+        runtime.scan = { ...runtime.scan, status: 'COMPLETE', complete: true, completedAt: nowIso(), error: null };
+    }
+
+    function failAuditScan(error) {
+        runtime.scan = { ...runtime.scan, status: 'FAILED', complete: false, completedAt: nowIso(), error: String(error?.message || error) };
+    }
+
     async function scanInventory() {
         if (runtime.running) return;
         runtime.running = true;
+        beginAuditScan();
         try {
             log('正在加载完整的 Steam 社区物品库存…');
-            await loadCompleteInventory();
+            const proof = await loadCompleteInventory();
             const pendingByAsset = await fetchPendingListingConfirmations();
+            assertScanScope(proof);
             const cards = collectTradingCards();
             if (cards.length > MAX_ITEMS_GUARD) {
                 throw new Error(`识别到 ${cards.length} 件卡牌，超过安全上限 ${MAX_ITEMS_GUARD}，已停止。`);
             }
+            assertScanScope(proof);
             const ledger = mergeScanIntoLedger(cards, pendingByAsset);
+            finishAuditScan(proof);
             const unique = new Set(cards.map(card => card.market_hash_name)).size;
             const duplicates = cards.length - unique;
             const lockedPending = cards.filter(card => pendingByAsset.has(card.assetid)).length;
             log(`只读盘点完成：${cards.length} 件、${unique} 种、重复副本 ${duplicates} 件；Steam 待确认锁定 ${lockedPending} 件。`, 'success');
             render(ledger);
         } catch (error) {
+            failAuditScan(error);
             log(error?.message || error, 'error');
         } finally {
             runtime.running = false;
@@ -510,13 +602,15 @@
     }
 
     async function fetchLowestBuyerCents(row, cache, forceRefresh = false) {
-        const key = `${row.appid}|${row.market_hash_name}`;
+        const wallet = getWalletInfo();
+        const key = `${wallet.wallet_currency}|${row.appid}|${row.contextid}|${row.market_hash_name}`;
         const cached = cache[key];
         if (!forceRefresh && cached && Date.now() - cached.at < CACHE_TTL_MS && cached.buyerCents > 0) {
             return { ...cached, cached: true };
         }
 
-        const wallet = getWalletInfo();
+        if (quoteRequests.has(key)) return quoteRequests.get(key);
+        const request = (async () => {
         const url = new URL('/market/priceoverview/', location.origin);
         url.searchParams.set('appid', row.appid);
         url.searchParams.set('market_hash_name', row.market_hash_name);
@@ -528,25 +622,31 @@
         if (response.status === 429) throw new Error('RATE_LIMITED');
         if (response.status === 401 || response.status === 403) throw new Error(`SESSION_HTTP_${response.status}`);
         if (!response.ok) throw new Error(`HTTP_${response.status}`);
-        const data = await response.json();
+        const data = response.body;
         const buyerCents = parsePriceToCents(data.lowest_price || '');
         if (!data.success) throw new Error('NO_PRICE');
         if (buyerCents <= 0) throw new Error('NO_ACTIVE_LISTING');
-        const result = { at: Date.now(), buyerCents, text: data.lowest_price };
+        const result = { at: Date.now(), buyerCents, text: data.lowest_price, currency: wallet.wallet_currency, source: 'priceoverview' };
         cache[key] = result;
         savePriceCache(cache);
         return result;
+        })();
+        quoteRequests.set(key, request);
+        try { return await request; } finally { quoteRequests.delete(key); }
     }
 
     async function buildDryRun() {
         if (runtime.running) return;
         runtime.running = true;
         runtime.pauseRequested = false;
+        beginAuditScan();
         try {
             let ledger = loadLedger();
-            await loadCompleteInventory();
+            const proof = await loadCompleteInventory();
             const pendingByAsset = await fetchPendingListingConfirmations();
+            assertScanScope(proof);
             ledger = mergeScanIntoLedger(collectTradingCards(), pendingByAsset);
+            finishAuditScan(proof);
             const rows = getInventoryRows(ledger);
             if (!rows.length) throw new Error('没有识别到可出售的集换式卡牌。');
 
@@ -574,11 +674,13 @@
             for (const [groupKey, group] of groups) {
                 if (runtime.pauseRequested) break;
                 try {
-                    const quote = await fetchLowestBuyerCents(group[0], cache, true);
+                    const quote = await fetchLowestBuyerCents(group[0], cache);
                     const lockAt = new Date(quote.at).toISOString();
                     const lockId = `${groupKey}|${quote.buyerCents}|${lockAt}`;
+                    const fees = new Map();
                     for (const row of group) {
-                        const receiveCents = calculateReceiveCents(quote.buyerCents, row.market_fee);
+                        if (!fees.has(row.market_fee)) fees.set(row.market_fee, calculateReceiveCents(quote.buyerCents, row.market_fee));
+                        const receiveCents = fees.get(row.market_fee);
                         ledger.assets[row.assetid] = {
                             ...ledger.assets[row.assetid],
                             buyerCents: quote.buyerCents,
@@ -587,7 +689,7 @@
                             quoteAt: lockAt,
                             priceLockId: lockId,
                             priceGroupKey: groupKey,
-                            priceSource: '最低卖单（批次锁价）',
+                            priceSource: quote.cached ? '最低卖单（缓存时间见报价，批次锁价）' : '最低卖单（批次锁价）',
                             state: STATES.PLANNED,
                             lastError: '',
                         };
@@ -613,6 +715,7 @@
             const total = planned.reduce((sum, row) => sum + toPositiveInt(row.receiveCents), 0);
             log(`预演完成：可提交 ${planned.length} 件，到手价合计 ${formatCents(total)}；取价失败 ${failed.length} 件。`, failed.length ? 'warn' : 'success');
         } catch (error) {
+            failAuditScan(error);
             log(error?.message || error, 'error');
         } finally {
             runtime.running = false;
@@ -657,10 +760,6 @@
         return { selected, total, groupCount: groupLocks.size };
     }
 
-    async function runBatch() {
-        log('此版本仅盘点、取价；请通过原生流程提交。', 'warn');
-    }
-
     function needsSubmissionReconciliation(row) {
         if ([
             STATES.SUBMITTING,
@@ -671,10 +770,6 @@
         ].includes(row?.state)) return true;
         return row?.state === STATES.EXTERNAL_PENDING
             && Boolean(row.submittedAt || row.submissionOutcomeUnknown);
-    }
-
-    async function reconcileAfterConfirmation() {
-        log('请通过原生流程核对待确认、暂挂、出售和库存状态。', 'warn');
     }
 
     function formatCents(cents) {
@@ -774,8 +869,30 @@
         return true;
     }
 
-    function render(ledger = loadLedger()) {
+    function auditSummary(ledger) {
+        if (runtime.scan.complete) {
+            try { assertScanScope(runtime.scanProof); } catch (error) { failAuditScan(error); }
+        }
+        const rows = getInventoryRows(ledger), scope = currentScope();
+        return { schema: AUDIT_SCHEMA, helperVersion: HELPER_VERSION, mode: 'READ_ONLY', busy: runtime.running,
+            currency: Number(globalThis.g_rgWalletInfo?.wallet_currency) || null, ...scope, scan: { ...runtime.scan },
+            assets: rows.map(row => ({ assetid: row.assetid, appid: row.appid, contextid: row.contextid,
+                market_hash_name: row.market_hash_name, marketable: row.marketable, tradable: row.tradable,
+                state: row.state, ...assetLock(row) })), feePreviewIsNativeApproval: false };
+    }
+
+    function render(ledger) {
         if (!runtime.shadow) return;
+        try { ledger ||= loadLedger(); } catch (error) {
+            failAuditScan(error);
+            const machine = runtime.shadow.querySelector('#scbl-agent-summary');
+            if (machine) machine.textContent = JSON.stringify({ schema: AUDIT_SCHEMA, helperVersion: HELPER_VERSION, mode: 'READ_ONLY',
+                busy: runtime.running, scan: { ...runtime.scan }, assets: [] });
+            const logs = runtime.shadow.querySelector('#scbl-logs');
+            if (logs) logs.textContent = error.message;
+            runtime.shadow.querySelectorAll('button').forEach(button => { button.disabled = true; });
+            return;
+        }
         const summary = summarize(ledger);
         const rows = getInventoryRows(ledger);
         const stats = runtime.shadow.querySelector('#scbl-stats');
@@ -785,18 +902,8 @@
         buttons.forEach(button => { button.disabled = runtime.running; });
         const pause = runtime.shadow.querySelector('#scbl-pause');
         if (pause) pause.disabled = !runtime.running;
-        for (const id of ['#scbl-run', '#scbl-reconcile']) {
-            const button = runtime.shadow.querySelector(id);
-            if (button) button.disabled = true;
-        }
         const machine = runtime.shadow.querySelector('#scbl-agent-summary');
-        if (machine) machine.textContent = JSON.stringify({
-            schema: 1, mode: 'READ_ONLY', busy: runtime.running,
-            currency: Number(globalThis.g_rgWalletInfo?.wallet_currency) || null,
-            inventory: summary.present, groups: summary.unique, pendingLocks: summary.externalPending,
-            quoted: summary.planned, feePreviewIsNativeApproval: false,
-            lastMessage: runtime.logLines.at(-1)?.message?.slice(0, 160) || '',
-        });
+        if (machine) machine.textContent = JSON.stringify(auditSummary(ledger));
 
         if (stats) {
             stats.innerHTML = [
@@ -842,7 +949,7 @@
         host.id = PANEL_ID;
         document.documentElement.appendChild(host);
         const shadow = host.attachShadow({ mode: 'open' });
-        host.dataset.auditSchema = '1';
+        host.dataset.auditSchema = String(AUDIT_SCHEMA);
         runtime.panel = host;
         runtime.shadow = shadow;
         shadow.innerHTML = `
@@ -857,25 +964,15 @@
                 .hidden{display:none}.collapsed .body{display:none}.collapsed{width:auto}.collapsed header{border-radius:10px}
             </style>
             <section class="panel">
-                <header><b>Steam 卡牌批量上架助手</b><span class="note">只读版 · 费用仍须原生页面确认</span><button id="scbl-collapse" class="secondary">收起</button></header>
+                <header><b>Steam 卡牌盘点与报价</b><span class="note">只读版 · 费用仍须原生页面确认</span><button id="scbl-collapse" class="secondary">收起</button></header>
                 <div class="body">
                     <div class="actions">
                         <button id="scbl-scan">1. 只读盘点</button>
                         <button id="scbl-plan">2. 获取最低价并预演</button>
-                        <label>每批 <input id="scbl-batch-size" type="number" min="1" max="50" value="${DEFAULT_BATCH_SIZE}"> 件</label>
-                        <button id="scbl-run" class="danger">提交请用原生流程</button>
                         <button id="scbl-pause" class="secondary" disabled>暂停</button>
-                        <button id="scbl-reconcile" class="secondary">对账请用原生流程</button>
                         <button id="scbl-export" class="secondary">导出台账</button>
                     </div>
-                    <div id="scbl-submit-confirm" class="submit-confirm" hidden>
-                        <p id="scbl-submit-confirm-message"></p>
-                        <div class="buttons">
-                            <button id="scbl-submit-confirm-accept" class="danger">确认提交</button>
-                            <button id="scbl-submit-confirm-cancel" class="secondary">取消</button>
-                        </div>
-                    </div>
-                    <pre id="scbl-agent-summary" style="white-space:pre-wrap;margin:8px 12px"></pre>
+                    <pre id="scbl-agent-summary" hidden></pre>
                     <div id="scbl-stats"></div>
                     <div class="table-wrap"><table>
                         <thead><tr><th>选</th><th>#</th><th>卡牌</th><th>assetid</th><th>买家最低价</th><th>卖家到手价</th><th>状态</th><th>来源/错误</th></tr></thead>
@@ -887,12 +984,10 @@
 
         shadow.querySelector('#scbl-scan').addEventListener('click', scanInventory);
         shadow.querySelector('#scbl-plan').addEventListener('click', buildDryRun);
-        shadow.querySelector('#scbl-run').addEventListener('click', runBatch);
         shadow.querySelector('#scbl-pause').addEventListener('click', () => {
             runtime.pauseRequested = true;
             log('已请求暂停；当前请求结束后停止。', 'warn');
         });
-        shadow.querySelector('#scbl-reconcile').addEventListener('click', reconcileAfterConfirmation);
         shadow.querySelector('#scbl-export').addEventListener('click', exportLedger);
         shadow.querySelector('#scbl-collapse').addEventListener('click', event => {
             const panel = shadow.querySelector('.panel');
@@ -924,6 +1019,8 @@
         migrateLedgerForSafety,
         resolveScannedState,
         needsSubmissionReconciliation,
+        assetLock, currentScope, ledgerKey, loadLedger, saveLedger, mergeScanIntoLedger,
+        loadCompleteInventory, fetchReadOnly, fetchLowestBuyerCents, auditSummary, scanInventory, buildDryRun,
         STATES,
     });
 

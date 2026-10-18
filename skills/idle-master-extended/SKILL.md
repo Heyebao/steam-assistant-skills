@@ -1,11 +1,11 @@
 ---
 name: idle-master-extended
-description: Install, launch, diagnose, repair, configure, and safely monitor Idle Master Extended on Windows, including concurrent idling, helper-process failures, and an explicitly requested Steam Invisible presence. Do not use for Steam credential extraction or market automation.
+description: Diagnose, install, repair, configure, and monitor Idle Master Extended on Windows, including steam-idle helpers and explicitly requested Steam Invisible presence. Excludes credential handling and market automation.
 ---
 
 # Idle Master Extended
 
-Use this skill for Windows tasks involving Idle Master Extended and its `steam-idle.exe` helpers.
+Use this skill for Windows tasks involving Idle Master Extended and its `steam-idle.exe` helpers. Start with read-only diagnosis; apply only changes covered by the active user request or automation.
 
 ## Safety boundaries
 
@@ -13,45 +13,36 @@ Use this skill for Windows tasks involving Idle Master Extended and its `steam-i
 - Do not inspect `steam-idle.exe` command-line arguments; count and health-check the processes only.
 - Do not change Steam, Idle Master, proxy, or privacy settings unless the user explicitly asks for that exact change.
 - Treat a notification-only monitor as notification-only. Do not start, stop, or restart processes unless the user explicitly authorizes it or the active automation explicitly allows it.
-- A static window is not evidence of a hang. Require a missing process/window, Windows `Responding=false`, a failed read-only window-state check, or a persistent helper-process anomaly.
+- Never read, copy, or reset a whole session-bearing `user.config` or configuration directory. For an authorized mode change, use the UI or only the non-sensitive mode-setting allowlist in the reference.
+- A static interface, hidden window, or failed observation is not evidence of a hang. Keep unavailable values as `unknown`, never zero or healthy by default.
 
 ## Locate and identify
 
-- Prefer discovery over a hardcoded username. The usual executable is `%LOCALAPPDATA%\Programs\IdleMasterExtended\IdleMasterExtended.exe`.
+- Prefer the user's specified executable, then known shortcut or executable-path metadata. Upstream supports portable extraction to a chosen folder; `%LOCALAPPDATA%\Programs\IdleMasterExtended\IdleMasterExtended.exe` is only a candidate path, not an official default.
 - The main process is `IdleMasterExtended.exe`; active game-idling helpers are `steam-idle.exe`.
-- Preserve existing installation files and user settings. Back up a binary before replacing it.
+- Match executable path and process creation time as well as name. Report ambiguous instances instead of choosing one silently.
 
 ## Status checks
 
-1. Confirm the main process and main window exist.
-2. Use a reliable read-only window-state or Windows responsiveness check.
+1. Locate the main process. Its absence means not running or exited, not a hung UI.
+2. Refresh process metadata before reading window/responsiveness values. A tray-hidden process may have no main-window handle; `Responding=true` without a handle does not establish UI health. Distinguish visible, hidden, unresponsive, and unobservable states.
 3. Read the program's own labels when available:
    - `游戏尚有卡牌` = remaining games.
    - `剩余卡牌掉落` = remaining card drops.
    - `正在运行` = UI-reported concurrent idling count.
-4. Count live `steam-idle.exe` processes without reading their arguments.
-5. Report the UI count and actual helper count separately. A mismatch alone does not justify a restart; allow a short transition and recheck.
+4. Count verified-owned live helpers separately from same-name processes with unknown ownership, without reading arguments. Record a count only when enumeration succeeded.
+5. Report UI and process observations independently with their times and errors. Recheck a mismatch against the current mode/phase; Fast mode normally includes single-helper and zero-helper phases. Use the reference before classifying a persistent anomaly.
 6. If labels say `读取徽章状态中` or `加载下一个游戏`, report unavailable statistics rather than guessing.
 
 ## Launch and restart
 
-- Launch the installed executable with its installation directory as the working directory.
-- After launch, verify a new main process and window, then check login and helper state.
-- If the user explicitly asks for a restart, stop only the exact Idle Master process and its owned helpers, launch the exact executable, and verify the replacement window.
+- Read [references/troubleshooting.md](references/troubleshooting.md#lifecycle-and-owned-helpers) before launching or restarting: upstream startup can terminate other same-user `steam-idle` processes. If another instance exists or helper ownership is unknown, stop automatic launch/restart and report the conflict.
+- For an authorized launch, use the exact executable and installation directory as its working directory. Verify replacement process identity and observable UI/login/helper state; do not require a visible window if it is hidden to the tray.
 - A restart may leave the app signed out. If it displays `Idle Master未登录到Steam`, stop and ask the user to log in manually; do not reuse pasted credentials or tokens.
 
 ## Concurrent idling
 
-For true Fast mode, the effective settings should be equivalent to:
-
-```text
-OnlyOneGameIdle = false
-OneThenMany = false
-fastMode = true
-IdlingModeWhitelist = false
-```
-
-The settings page can display Fast mode while a legacy `OneThenMany=true` value still wins in startup logic. When the user authorizes the change, select Fast mode and save once, then verify one live helper per concurrently idled game after the transition settles.
+For mode changes or unexpectedly low helper counts, read the authoritative [mode settings and Fast phases](references/troubleshooting.md#mode-settings-and-fast-phases). Do not equate remaining games with expected concurrent helpers.
 
 ## Steam Invisible presence
 
@@ -64,8 +55,8 @@ Only enable or maintain this when the user explicitly asks.
 
 ## Troubleshooting routing
 
-Read [references/troubleshooting.md](references/troubleshooting.md) when helpers crash, the UI/API stalls, Fast mode runs only one game, or a proxy/CDN error is suspected.
+Read only the relevant section of [references/troubleshooting.md](references/troubleshooting.md) for lifecycle conflicts, mode diagnosis, helper crashes, API/proxy symptoms, or binary repair. Read its compatibility note before installing or patching an executable.
 
 ## Completion
 
-Report the resulting main-window health, login state, remaining-game/card counts when readable, UI running count, actual helper count, and whether Steam presence was changed. Explicitly state any statistic that could not be read.
+Report main-process identity, window visibility/health, UI-reported login state, readable remaining-game/card counts, UI running count, verified-owned and unknown-ownership helper counts, and whether Steam presence changed. State observation errors and unknowns explicitly. Process survival or a matching count alone does not prove card drops.

@@ -73,7 +73,7 @@ async function main() {
     await makeNativeIO({ sell: single.tab }).prepare(groups[0], batches[0]);
     assert.equal(single.trace.length, 5, 'legacy native preparation also combines DOM reads');
 
-    const cancelTrace = [], sources = ['1001', '1002'].map((listingid, i) => ({ listingid, appid: '753', submission_contextid: '6', assetid: '200' + (i + 1) }));
+    const cancelTrace = [], sources = ['1001', '1002'].map((listingid, i) => ({ listingid, appid: '753', submission_contextid: '6', observed_contextid: '6', assetid: '200' + (i + 1) }));
     const market = { playwright: {
         locator(selector) {
             const source = sources.find(r => selector === '#mylisting_' + r.listingid);
@@ -91,18 +91,20 @@ async function main() {
     assert.equal(cancelTrace.length, 8, 'each cancel uses four guarded native operations');
 
     const inventoryTrace = [], profile = 'https://steamcommunity.com/id/offline/inventory';
-    const inventorySnapshot = { schema: '1', currency: 23, busy: false, account,
-        log: '只读盘点完成：0 件、0 种', rows: [] };
+    let generation = 0;
+    const inventorySnapshot = { schema: '2', account, url: profile, data: { schema: 2, helperVersion: '0.4.0', mode: 'READ_ONLY',
+        currency: 23, busy: false, account, inventoryProfileUrl: profile, appid: '753', contextid: '6',
+        scan: { generation: 'fixture-0', status: 'COMPLETE', complete: true, startedAt: '2026-10-18T00:00:00Z', completedAt: '2026-10-18T00:00:01Z', error: null }, assets: [] } };
     const inventory = { async url() { inventoryTrace.push('profile'); return profile; },
         async reload() { inventoryTrace.push('reload'); }, playwright: {
             getByRole() { return { async click() { inventoryTrace.push('scan'); } }; },
             locator() { return { async waitFor() { inventoryTrace.push('finished'); } }; },
-            async evaluate() { inventoryTrace.push('snapshot'); return clone(inventorySnapshot); },
+            async evaluate() { inventoryTrace.push('snapshot'); inventorySnapshot.data.scan.generation = 'fixture-' + (++generation); return clone(inventorySnapshot); },
         } };
     const inventoryIO = makeNativeIO({ inventory, inventoryProfileUrl: profile });
     assert.equal((await inventoryIO.readInventory()).account, account);
     assert.equal(inventoryTrace.length, 5);
-    inventorySnapshot.busy = true;
+    inventorySnapshot.data.busy = true;
     await assert.rejects(() => inventoryIO.readInventory(), /INVENTORY_INCOMPLETE/);
     console.log('PASS: native fee/account/cohort/terms checks; two-group form uses 8 browser operations, single-group preparation 5, cancellation 4/card, inventory scan 5; no live requests.');
 }

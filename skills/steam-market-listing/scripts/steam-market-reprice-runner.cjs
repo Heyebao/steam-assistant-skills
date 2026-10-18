@@ -6,6 +6,10 @@
 const DONE = new Set(['PENDING_MOBILE_CONFIRMATION', 'CONFIRMED_MARKET_HOLD', 'ACTIVE']);
 const UNSAFE = new Set(['SUBMITTING_NATIVE', 'CANCEL_REQUESTED', 'OUTCOME_UNKNOWN', 'RECONCILE_PENDING']);
 const IN_FLIGHT_JOBS = new Set(); // Process-local only; never run two owners of one ledger.
+const HELPER_VERSION = '0.4.0', HELPER_SCHEMA = 2;
+const HELPER_LOCKED_STATES = new Set(['EXTERNAL_PENDING', 'SUBMITTING', 'SUBMITTED', 'PAUSED_CONFIRMATIONS',
+    'RECONCILE_PENDING', 'OUTCOME_UNKNOWN', 'QUARANTINED', 'ACTIVE']);
+const HELPER_STATES = new Set([...HELPER_LOCKED_STATES, 'DISCOVERED', 'PLANNED', 'PRICE_ERROR', 'RETRYABLE_ERROR']);
 const money = cents => (cents / 100).toFixed(2);
 const cents = text => {
     const value = String(text).replace(/[^\d.]/g, '');
@@ -37,7 +41,7 @@ function buildNativeBatchUrl(groups) {
     }
     return url.toString();
 }
-function verifyNativeSnapshot(snapshot, groups, batches, prices = true) {
+function verifyNativeSnapshot(snapshot, groups, batches, prices = true, preview = false) {
     if (snapshot.account !== batches[0].account) fail('ACCOUNT_MISMATCH');
     const actual = new URL(snapshot.url);
     const expected = new URL(buildNativeBatchUrl(groups.map((g, i) => ({ hash: g.hash, quantity: batches[i].quantity }))));
@@ -48,7 +52,7 @@ function verifyNativeSnapshot(snapshot, groups, batches, prices = true) {
     if (snapshot.rows.length !== groups.length || new Set(snapshot.rows.map(r => r.hash)).size !== groups.length) fail('NATIVE_IDENTITY_MISMATCH');
     const checks = groups.map((group, i) => {
         const row = snapshot.rows.find(r => r.hash === group.hash), batch = batches[i];
-        if (!row || row.quantity !== batch.quantity || row.available !== batch.quantity) fail('NATIVE_PRICE_OR_QUANTITY_MISMATCH');
+        if (!row || row.quantity !== batch.quantity || (preview ? !Number.isSafeInteger(row.available) || row.available < 0 : row.available !== batch.quantity)) fail('NATIVE_PRICE_OR_QUANTITY_MISMATCH');
         if (!prices) return null;
         const buyerCents = cents(row.prices[1]), receiveCents = cents(row.prices[0]);
         if (buyerCents !== batch.buyerCents || receiveCents !== batch.receiveCents) fail('NATIVE_PRICE_OR_QUANTITY_MISMATCH');
@@ -115,6 +119,38 @@ function parseCompleteMarketSnapshot(snapshot) {
         market.rows.filter(r => r.state === 'CONFIRMED_MARKET_HOLD').length !== heldTotal) fail('MARKET_PAGINATED', '出售或暂挂分区未完整显示；先调整可见分页，再只读核对。');
     return market;
 }
+function parseHelperSnapshot(snapshot, inventoryProfileUrl, previousGeneration = null) {
+    const data = snapshot.data, normalized = value => {
+        const url = new URL(value);
+        return url.origin + url.pathname.replace(/\/$/, '');
+    };
+    if (snapshot.schema !== String(HELPER_SCHEMA) || data?.schema !== HELPER_SCHEMA ||
+        data.helperVersion !== HELPER_VERSION || data.mode !== 'READ_ONLY') fail('READ_ONLY_HELPER_UPDATE_REQUIRED');
+    if (!data.account || snapshot.account !== data.account) fail('INVENTORY_ACCOUNT_MISMATCH');
+    if (normalized(snapshot.url) !== normalized(inventoryProfileUrl) ||
+        normalized(data.inventoryProfileUrl) !== normalized(inventoryProfileUrl)) fail('INVENTORY_PROFILE_MISMATCH');
+    if (data.appid !== '753' || data.contextid !== '6') fail('INVENTORY_CONTEXT_MISMATCH');
+    if (data.currency !== 23) fail('UNSUPPORTED_CURRENCY');
+    const scan = data.scan;
+    if (data.busy !== false || scan?.complete !== true || scan.status !== 'COMPLETE' || scan.error !== null ||
+        typeof scan.generation !== 'string' || !scan.generation || scan.generation === previousGeneration ||
+        !Number.isFinite(Date.parse(scan.startedAt)) || !Number.isFinite(Date.parse(scan.completedAt)) ||
+        Date.parse(scan.completedAt) < Date.parse(scan.startedAt) || !Array.isArray(data.assets)) fail('INVENTORY_INCOMPLETE');
+    const seen = new Set();
+    const rows = data.assets.map(row => {
+        if (typeof row.assetid !== 'string' || !/^\d+$/.test(row.assetid) || seen.has(row.assetid) || row.appid !== '753' || row.contextid !== '6' ||
+            !/^\d+-.+/.test(row.market_hash_name) || typeof row.marketable !== 'boolean' || typeof row.tradable !== 'boolean') fail('INVENTORY_INCOMPLETE');
+        seen.add(row.assetid);
+        if (!HELPER_STATES.has(row.state) || typeof row.locked !== 'boolean' ||
+            row.locked && (typeof row.lockReason !== 'string' || !row.lockReason) ||
+            !row.locked && (row.lockReason !== null || HELPER_LOCKED_STATES.has(row.state) || !row.marketable || !row.tradable)) fail('HELPER_LOCK_UNPROVEN');
+        return { assetid: row.assetid, hash: row.market_hash_name, state: row.state,
+            locked: row.locked, lockReason: row.lockReason, pending: row.state === 'EXTERNAL_PENDING',
+            eligible: row.marketable && row.tradable && !row.locked };
+    });
+    rows.account = data.account; rows.scanGeneration = scan.generation;
+    return rows;
+}
 function observeBatch(batch, market, inventory) {
     const exact = new Set(batch.submissionAssetids);
     if (exact.size !== batch.quantity || inventory.length !== new Set(inventory.map(r => r.assetid)).size) fail('ASSET_COUNT_MISMATCH');
@@ -156,11 +192,13 @@ function compactSummary(ledger, current = null, error = null, approved = null) {
 function makeNativeIO({ market, inventory, sell, inventoryProfileUrl }) {
     const handles = [market, inventory, sell].filter(Boolean);
     if (new Set(handles).size !== handles.length) fail('SEPARATE_TABS_REQUIRED');
+    let inventoryGeneration = null;
     // A single DOM observation collects every field; evaluate never clicks or fills.
     const readNative = () => sell.playwright.evaluate(() => ({
         account: document.querySelector('#account_pulldown')?.innerText.trim(), url: document.URL,
         terms: document.querySelector('#market_multi_accept_ssa')?.checked === true,
         total: document.querySelector('#market_multisell_total')?.innerText || '',
+        submitControl: Array.from(document.querySelectorAll('a')).some(a => a.innerText.trim() === '创建上架物品'),
         rows: Array.from(document.querySelectorAll('a[href*="/market/listings/753/"]')).filter(a => a.closest('tr')?.querySelector('input[type="number"]')).map(a => {
             const row = a.closest('tr'), match = new URL(a.href).pathname.match(/^\/market\/listings\/753\/([^/]+)\/?$/);
             const available = row.innerText.match(/共\s*(\d+)\s*个/);
@@ -210,41 +248,34 @@ function makeNativeIO({ market, inventory, sell, inventoryProfileUrl }) {
             await inventory.playwright.locator('#scbl-scan:not([disabled])').waitFor({ state: 'attached', timeoutMs: 15000 });
             const snapshot = await inventory.playwright.evaluate(() => {
                 const root = document.querySelector('#codex-steam-card-listing-panel')?.shadowRoot;
-                const summary = JSON.parse(root?.querySelector('#scbl-agent-summary')?.textContent || '{}');
                 return { schema: document.querySelector('#codex-steam-card-listing-panel')?.getAttribute('data-audit-schema'),
                     account: document.querySelector('#account_pulldown')?.innerText?.trim(),
-                    currency: summary.currency,
-                    busy: summary.busy,
-                    log: root?.querySelector('#scbl-logs')?.firstElementChild?.innerText,
-                    rows: Array.from(root?.querySelectorAll('#scbl-rows tr') || []).map(r => ({
-                        assetid: r.querySelector('[data-assetid]')?.getAttribute('data-assetid'),
-                        hash: r.querySelector('td[title]')?.getAttribute('title'),
-                        pending: r.innerText.includes('Steam 待确认（锁定）'),
-                        eligible: r.querySelector('[data-assetid]')?.getAttribute('data-appid') === '753' &&
-                            r.querySelector('[data-assetid]')?.getAttribute('data-contextid') === '6' &&
-                            r.querySelector('[data-assetid]')?.getAttribute('data-marketable') === '1' &&
-                            r.querySelector('[data-assetid]')?.getAttribute('data-tradable') === '1',
-                    })) };
+                    url: document.URL,
+                    data: JSON.parse(root?.querySelector('#scbl-agent-summary')?.textContent || '{}') };
             });
-            const count = snapshot.log?.match(/只读盘点完成：\s*(\d+)\s*件/);
-            if (snapshot.schema !== '1') fail('READ_ONLY_HELPER_UPDATE_REQUIRED', '库存助手未提供交易锁定元数据；请先更新只读版，未执行撤单。');
-            if (snapshot.currency !== 23) fail('UNSUPPORTED_CURRENCY');
-            if (snapshot.busy !== false) fail('INVENTORY_INCOMPLETE');
-            if (!count || Number(count[1]) !== snapshot.rows.length || snapshot.rows.some(r => !r.assetid || !r.hash) ||
-                new Set(snapshot.rows.map(r => r.assetid)).size !== snapshot.rows.length) fail('INVENTORY_INCOMPLETE');
-            snapshot.rows.account = snapshot.account;
-            return snapshot.rows;
+            const rows = parseHelperSnapshot(snapshot, inventoryProfileUrl, inventoryGeneration);
+            inventoryGeneration = rows.scanGeneration;
+            return rows;
         },
         async cancel(row) {
             const old = market.playwright.locator('#mylisting_' + row.listingid);
             const link = old.getByRole('link', { name: '撤下', exact: true });
             const href = await link.getAttribute('href');
             const match = href?.match(/RemoveMarketListing\('mylisting',\s*'(\d+)',\s*(\d+),\s*'(\d+)',\s*'(\d+)'\)/);
-            if (!match || match[1] !== row.listingid || match[2] !== row.appid || match[3] !== row.submission_contextid || match[4] !== row.assetid) fail('CANCEL_IDENTITY_MISMATCH');
+            if (!['6', '16'].includes(row.observed_contextid) || !match || match[1] !== row.listingid || match[2] !== row.appid ||
+                match[3] !== row.observed_contextid || match[4] !== row.assetid) fail('CANCEL_IDENTITY_MISMATCH');
             await link.click();
             const yes = market.playwright.getByText('是的，移除此上架物品', { exact: true });
             await yes.click();
             await old.waitFor({ state: 'hidden', timeoutMs: 15000 });
+        },
+        async preflightNative(groups, account) {
+            const batches = groups.map(() => ({ account, quantity: 0 }));
+            await sell.goto(buildNativeBatchUrl(groups.map(group => ({ hash: group.hash, quantity: 0 }))));
+            const snapshot = await readNative();
+            verifyNativeSnapshot(snapshot, groups, batches, false, true);
+            if (!snapshot.submitControl || snapshot.rows.some(row => row.prices.length !== 2)) fail('NATIVE_PREFLIGHT_REQUIRED');
+            return { account, hashes: groups.map(group => group.hash) };
         },
         async prepare(group, batch) {
             await sell.goto(buildNativeUrl(group.hash, batch.quantity));
@@ -336,7 +367,7 @@ function createRunner({ ledger, tabs, io = tabs && makeNativeIO({ ...tabs, inven
         groups.forEach((g, i) => {
             const b = batches[i], cohort = inventory.filter(r => r.hash === g.hash);
             if (market.rows.some(r => b.oldListingids.includes(r.listingid)) || cohort.length !== b.quantity ||
-                cohort.some(r => !r.eligible || r.pending || b.beforeAssetIds.includes(r.assetid)) ||
+                cohort.some(r => !r.eligible || r.locked !== false || r.pending || !HELPER_STATES.has(r.state) || b.beforeAssetIds.includes(r.assetid)) ||
                 new Set(cohort.map(r => r.assetid)).size !== b.quantity ||
                 market.rows.some(r => r.appid === '753' && cohort.some(a => a.assetid === r.assetid))) fail('RETURNED_COHORT_MISMATCH');
             if (b.submissionAssetids.length && (b.submissionAssetids.length !== b.quantity || cohort.some(r => !b.submissionAssetids.includes(r.assetid)))) fail('RETURNED_COHORT_MISMATCH');
@@ -362,7 +393,7 @@ function createRunner({ ledger, tabs, io = tabs && makeNativeIO({ ...tabs, inven
                 const remaining = plan.groups.filter(g => !finished(ledger.batches.find(b => b.key === g.key)));
                 if (!remaining.length) return summarize();
                 groups = batchGroups ? remaining : remaining.slice(0, 1);
-                execution = ledger.execution = { phase: 'CHECK_BEFORE', keys: groups.map(g => g.key), priceIndex: 0, fingerprint: approvedFingerprint };
+                execution = ledger.execution = { phase: 'PREFLIGHT', keys: groups.map(g => g.key), priceIndex: 0, fingerprint: approvedFingerprint };
                 await save();
             } else {
                 if (execution.fingerprint !== approvedFingerprint || !Array.isArray(execution.keys) ||
@@ -372,7 +403,15 @@ function createRunner({ ledger, tabs, io = tabs && makeNativeIO({ ...tabs, inven
             }
             batches = lockedBatches(groups);
             guardAction(groups, batches);
-            if (execution.phase === 'CHECK_BEFORE') {
+            if (execution.phase === 'PREFLIGHT') {
+                if (typeof io.preflightNative !== 'function') fail('NATIVE_PREFLIGHT_REQUIRED');
+                const proof = await io.preflightNative(groups, plan.account);
+                guardAction(groups, batches);
+                if (proof?.account !== plan.account || JSON.stringify(proof.hashes) !== JSON.stringify(groups.map(g => g.hash))) fail('NATIVE_PREFLIGHT_REQUIRED');
+                execution.nativePreflight = { ...proof, schema: 1 };
+                execution.phase = 'CHECK_BEFORE'; await save();
+            } else if (execution.phase === 'CHECK_BEFORE') {
+                if (execution.nativePreflight?.schema !== 1) fail('NATIVE_PREFLIGHT_REQUIRED');
                 const { market, inventory } = await checkpoint();
                 // Validate the entire cohort before creating cancellation state.
                 groups.forEach((g, i) => {
@@ -385,7 +424,8 @@ function createRunner({ ledger, tabs, io = tabs && makeNativeIO({ ...tabs, inven
                     for (const source of g.rows) {
                         const active = market.rows.find(r => r.listingid === source.listingid);
                         if (source.state !== 'APPROVED_ACTIVE' || !active || active.state !== 'ACTIVE' || active.assetid !== source.assetid ||
-                            active.appid !== source.appid || active.observed_contextid !== source.submission_contextid || active.url !== source.url) fail('SOURCE_NOT_APPROVED_ACTIVE');
+                            active.appid !== source.appid || !['6', '16'].includes(active.observed_contextid) || active.url !== source.url) fail('SOURCE_NOT_APPROVED_ACTIVE');
+                        source.observed_contextid = active.observed_contextid;
                     }
                 });
                 groups.forEach((g, i) => {
@@ -402,6 +442,8 @@ function createRunner({ ledger, tabs, io = tabs && makeNativeIO({ ...tabs, inven
                 } else execution.phase = 'CANCEL';
                 await save();
             } else if (execution.phase === 'CANCEL') {
+                if (execution.nativePreflight?.schema !== 1 || execution.nativePreflight.account !== plan.account ||
+                    JSON.stringify(execution.nativePreflight.hashes) !== JSON.stringify(groups.map(g => g.hash))) fail('NATIVE_PREFLIGHT_REQUIRED');
                 const group = groups.find(g => g.rows.some(r => r.state !== 'CANCELLED_INVENTORY_PENDING'));
                 if (!group) fail('EXECUTION_LOCK_MISMATCH');
                 const row = group.rows.find(r => r.state !== 'CANCELLED_INVENTORY_PENDING');
@@ -519,4 +561,4 @@ function createRunner({ ledger, tabs, io = tabs && makeNativeIO({ ...tabs, inven
         } };
 }
 module.exports = { createRunner, makeNativeIO, validatePlan, buildNativeUrl, buildNativeBatchUrl, verifyNativeSnapshot,
-    parseMarketRows, parseCompleteMarketSnapshot, observeBatch, compactSummary };
+    parseMarketRows, parseCompleteMarketSnapshot, parseHelperSnapshot, observeBatch, compactSummary };
