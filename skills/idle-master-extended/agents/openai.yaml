@@ -1,0 +1,4 @@
+interface:
+  display_name: "Idle Master Extended Assistant"
+  short_description: "Install, repair, configure, and safely monitor Idle Master"
+  default_prompt: "Use $idle-master-extended to diagnose and safely maintain Idle Master Extended."

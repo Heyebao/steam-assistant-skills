@@ -1,0 +1,4 @@
+interface:
+  display_name: "Steam 市场安全上架"
+  short_description: "盘点、查价、计算手续费并安全上架 Steam 社区市场物品"
+  default_prompt: "使用 $steam-market-listing 安全盘点、预演价格并上架我的 Steam 市场物品。"
